@@ -1,1 +1,205 @@
- 
+ const express = require("express");
+const cors = require("cors");
+const admin = require("firebase-admin");
+
+const app = express();
+app.use(express.json({ limit: "20mb" }));
+app.use(cors({ origin: process.env.FRONTEND_URL || "*" }));
+
+// ─── Firebase Admin (verifica tokens) ───────────────────────────────────────
+admin.initializeApp({
+  credential: admin.credential.cert({
+    projectId: process.env.FIREBASE_PROJECT_ID,
+    clientEmail: process.env.FIREBASE_CLIENT_EMAIL,
+    privateKey: process.env.FIREBASE_PRIVATE_KEY?.replace(/\\n/g, "\n"),
+  }),
+});
+const db = admin.firestore();
+
+// ─── Middleware: verifica token Firebase ────────────────────────────────────
+async function autenticar(req, res, next) {
+  const auth = req.headers.authorization;
+  if (!auth?.startsWith("Bearer ")) {
+    return res.status(401).json({ erro: "Token não fornecido." });
+  }
+  try {
+    const decoded = await admin.auth().verifyIdToken(auth.split(" ")[1]);
+    req.uid = decoded.uid;
+    req.email = decoded.email;
+    next();
+  } catch {
+    res.status(401).json({ erro: "Token inválido ou expirado." });
+  }
+}
+
+// ─── Limite diário: 5 legendas/dia no plano free ───────────────────────────
+const LIMITE_DIARIO = parseInt(process.env.LIMITE_DIARIO || "5");
+
+async function verificarLimite(req, res, next) {
+  const uid = req.uid;
+  const hoje = new Date().toISOString().split("T")[0]; // "2025-01-15"
+  const ref = db.collection("uso_diario").doc(`${uid}_${hoje}`);
+  const doc = await ref.get();
+
+  const usos = doc.exists ? doc.data().usos : 0;
+  if (usos >= LIMITE_DIARIO) {
+    return res.status(429).json({
+      erro: `Limite de ${LIMITE_DIARIO} legendas/dia atingido. Volte amanhã!`,
+      limite: LIMITE_DIARIO,
+      usos,
+    });
+  }
+
+  req.usoRef = ref;
+  req.usos = usos;
+  next();
+}
+
+// ─── Rota: gerar legenda ────────────────────────────────────────────────────
+app.post("/gerar-legenda", autenticar, verificarLimite, async (req, res) => {
+  const { prompt, imagens, model } = req.body;
+
+  if (!prompt) return res.status(400).json({ erro: "Prompt obrigatório." });
+
+  const content =
+    imagens?.length > 0
+      ? [
+          ...imagens.map((im) => ({
+            type: "image",
+            source: { type: "base64", media_type: im.tipo, data: im.b64 },
+          })),
+          { type: "text", text: prompt },
+        ]
+      : prompt;
+
+  try {
+    const anthropicRes = await fetch("https://api.anthropic.com/v1/messages", {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        "x-api-key": process.env.ANTHROPIC_API_KEY,
+        "anthropic-version": "2023-06-01",
+      },
+      body: JSON.stringify({
+        model: model || "claude-sonnet-4-20250514",
+        max_tokens: 2000,
+        system:
+          "Responda SOMENTE com JSON puro válido. Sem texto, markdown ou backticks fora do JSON.",
+        messages: [{ role: "user", content }],
+      }),
+    });
+
+    if (!anthropicRes.ok) {
+      const err = await anthropicRes.text();
+      throw new Error(`Anthropic ${anthropicRes.status}: ${err}`);
+    }
+
+    const data = await anthropicRes.json();
+    const raw = data.content.map((i) => i.text || "").join("").trim();
+    const match = raw.match(/\{[\s\S]*\}/);
+    if (!match) throw new Error("JSON não encontrado na resposta.");
+    const parsed = JSON.parse(match[0]);
+
+    // Incrementar uso diário
+    const hoje = new Date().toISOString().split("T")[0];
+    await req.usoRef.set({ usos: req.usos + 1, data: hoje, uid: req.uid }, { merge: true });
+
+    // Salvar no histórico
+    await db.collection("historico").add({
+      uid: req.uid,
+      email: req.email,
+      prompt: prompt.substring(0, 500),
+      legendas: parsed.legendas,
+      criadoEm: admin.firestore.FieldValue.serverTimestamp(),
+    });
+
+    res.json({ ...parsed, usos: req.usos + 1, limite: LIMITE_DIARIO });
+  } catch (err) {
+    console.error("Erro /gerar-legenda:", err.message);
+    res.status(500).json({ erro: err.message });
+  }
+});
+
+// ─── Rota: verificar gramática ──────────────────────────────────────────────
+app.post("/verificar-gramatica", autenticar, async (req, res) => {
+  const { texto } = req.body;
+  if (!texto) return res.status(400).json({ erro: "Texto obrigatório." });
+
+  const prompt = `Você é revisor gramatical profissional de português brasileiro.
+Analise: "${texto}"
+Verifique gramática, ortografia, pontuação, concordância, coesão.
+Retorne SOMENTE JSON puro:
+{"status":"ok","resumo":"sem erros.","itens":[],"textoCorrigido":"${texto}"}
+ou se houver erros:
+{"status":"erros","resumo":"resumo","itens":[{"tipo":"tipo","problema":"desc","sugestao":"fix"}],"textoCorrigido":"texto corrigido"}`;
+
+  try {
+    const anthropicRes = await fetch("https://api.anthropic.com/v1/messages", {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        "x-api-key": process.env.ANTHROPIC_API_KEY,
+        "anthropic-version": "2023-06-01",
+      },
+      body: JSON.stringify({
+        model: "claude-sonnet-4-20250514",
+        max_tokens: 1000,
+        system: "Responda SOMENTE com JSON puro válido.",
+        messages: [{ role: "user", content: prompt }],
+      }),
+    });
+
+    const data = await anthropicRes.json();
+    const raw = data.content.map((i) => i.text || "").join("").trim();
+    const match = raw.match(/\{[\s\S]*\}/);
+    if (!match) throw new Error("JSON inválido");
+    res.json(JSON.parse(match[0]));
+  } catch (err) {
+    res.status(500).json({ erro: err.message });
+  }
+});
+
+// ─── Rota: histórico do usuário ─────────────────────────────────────────────
+app.get("/historico", autenticar, async (req, res) => {
+  try {
+    const snap = await db
+      .collection("historico")
+      .where("uid", "==", req.uid)
+      .orderBy("criadoEm", "desc")
+      .limit(20)
+      .get();
+
+    const itens = snap.docs.map((d) => ({ id: d.id, ...d.data() }));
+    res.json({ historico: itens });
+  } catch (err) {
+    res.status(500).json({ erro: err.message });
+  }
+});
+
+// ─── Rota: uso do dia ──────────────────────────────────────────────────────
+app.get("/uso", autenticar, async (req, res) => {
+  const hoje = new Date().toISOString().split("T")[0];
+  const ref = db.collection("uso_diario").doc(`${req.uid}_${hoje}`);
+  const doc = await ref.get();
+  const usos = doc.exists ? doc.data().usos : 0;
+  res.json({ usos, limite: LIMITE_DIARIO, restantes: LIMITE_DIARIO - usos });
+});
+
+// ─── Rota: preferências do usuário ─────────────────────────────────────────
+app.get("/preferencias", autenticar, async (req, res) => {
+  const doc = await db.collection("preferencias").doc(req.uid).get();
+  res.json(doc.exists ? doc.data() : {});
+});
+
+app.post("/preferencias", autenticar, async (req, res) => {
+  await db.collection("preferencias").doc(req.uid).set(req.body, { merge: true });
+  res.json({ ok: true });
+});
+
+// ─── Health check ──────────────────────────────────────────────────────────
+app.get("/", (_, res) => res.json({ status: "ok", versao: "1.0.0" }));
+
+const PORT = process.env.PORT || 3001;
+app.listen(PORT, () => console.log(`Servidor rodando na porta ${PORT}`));
+
+
