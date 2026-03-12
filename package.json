@@ -1,14 +1,14 @@
 {
-  "name": "criador-legendas",
+  "name": "criador-legendas-api",
   "version": "1.0.0",
+  "main": "server.js",
   "scripts": {
-    "dev": "concurrently \"npm run dev:api\" \"npm run dev:frontend\"",
-    "dev:api": "cd api && npm run dev",
-    "dev:frontend": "cd frontend && npm run dev",
-    "build": "cd frontend && npm run build",
-    "install:all": "cd api && npm install && cd ../frontend && npm install"
+    "start": "node server.js",
+    "dev": "node --watch server.js"
   },
-  "devDependencies": {
-    "concurrently": "^8.2.0"
+  "dependencies": {
+    "cors": "^2.8.5",
+    "express": "^4.18.2",
+    "node-fetch": "^3.3.2"
   }
 }
